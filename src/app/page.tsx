@@ -34,6 +34,7 @@ import {
 import type {
   Seat,
   ExamGroup,
+  ExamDifficulty,
   SeatingSaveFile,
   SeatingMode,
   SeatPosition,
@@ -174,25 +175,6 @@ function generateExamStudentsFromGroups(groups: ExamGroup[]) {
   return students;
 }
 
-function snakeSeatOrder(rows: number, columns: number) {
-  const order: Seat[] = [];
-
-  for (const position of ["left", "right"] as SeatPosition[]) {
-    for (let column = 1; column <= columns; column += 1) {
-      const rowNumbers =
-        column % 2 === 1
-          ? Array.from({ length: rows }, (_, index) => index + 1)
-          : Array.from({ length: rows }, (_, index) => rows - index);
-
-      for (const row of rowNumbers) {
-        order.push({ row, column, position, studentId: null });
-      }
-    }
-  }
-
-  return order;
-}
-
 function snakeSeatOrderForSide(
   rows: number,
   columns: number,
@@ -269,29 +251,144 @@ function assignGradeSides(students: Student[], sideCapacity: number) {
   return best.assignment;
 }
 
-function placeStudentsSnake(
-  students: Student[],
+function placeExamGroupsForCollection(
+  groups: ExamGroup[],
   rows: number,
   columns: number,
 ) {
   const seats = generateSeats(rows, columns);
-  const order = snakeSeatOrder(rows, columns);
-  const orderIndexByKey = new Map(order.map((seat, index) => [seatKey(seat), index]));
   const studentIdBySeatKey = new Map<string, string>();
+  const gradeKeyBySeatKey = new Map<string, string>();
+  const students: Student[] = [];
+  const unassignedIds: string[] = [];
+  const occupiedSeatKeys = new Set<string>();
 
-  order.forEach((seat, index) => {
-    const student = students[index];
-    if (student) {
-      studentIdBySeatKey.set(seatKey(seat), student.id);
+  function oppositeSeatKey(seat: Seat) {
+    return seatKey({
+      ...seat,
+      position: seat.position === "left" ? "right" : "left",
+    });
+  }
+
+  function seatsForPosition(position: SeatPosition, gradeKey: string) {
+    const availableSeats: Seat[] = [];
+
+    for (let column = 1; column <= columns; column += 1) {
+      const rowNumbers =
+        column % 2 === 1
+          ? Array.from({ length: rows }, (_, index) => index + 1)
+          : Array.from({ length: rows }, (_, index) => rows - index);
+
+      for (const row of rowNumbers) {
+        const seat: Seat = { row, column, position, studentId: null };
+        const key = seatKey(seat);
+
+        if (
+          !occupiedSeatKeys.has(key) &&
+          gradeKeyBySeatKey.get(oppositeSeatKey(seat)) !== gradeKey
+        ) {
+          availableSeats.push(seat);
+        }
+      }
+    }
+
+    return availableSeats;
+  }
+
+  function chooseSeats(studentCount: number, gradeKey: string) {
+    const sideOptions = (["left", "right"] as SeatPosition[])
+      .map((position) => {
+        const seats = seatsForPosition(position, gradeKey);
+
+        return {
+          position,
+          seats,
+          capacity: seats.length,
+          firstColumn: seats[0]?.column ?? Number.POSITIVE_INFINITY,
+          firstRow: seats[0]?.row ?? Number.POSITIVE_INFINITY,
+        };
+      })
+      .filter((option) => option.capacity > 0)
+      .sort((first, second) => {
+        if (first.firstColumn !== second.firstColumn) {
+          return first.firstColumn - second.firstColumn;
+        }
+
+        if (first.firstRow !== second.firstRow) {
+          return first.firstRow - second.firstRow;
+        }
+
+        if (first.capacity !== second.capacity) {
+          return second.capacity - first.capacity;
+        }
+
+        return first.position === "left" ? -1 : 1;
+      });
+
+    const fullFit = sideOptions.find((option) => option.capacity >= studentCount);
+    const selectedSeats = fullFit?.seats ?? sideOptions[0]?.seats ?? [];
+
+    return selectedSeats.slice(0, studentCount);
+  }
+
+  groups.map(sanitizeExamGroup).forEach((group) => {
+    if (!group.grade) {
+      return;
+    }
+
+    const studentCount = group.endRoll - group.startRoll + 1;
+    const groupGradeKey = group.grade.trim().toLowerCase();
+    const seatsForGroup = chooseSeats(studentCount, groupGradeKey);
+    let groupSeatIndex = 0;
+
+    for (
+      let rollNumber = group.startRoll;
+      rollNumber <= group.endRoll;
+      rollNumber += 1
+    ) {
+      const name = examStudentLabel(group.grade, group.division, rollNumber);
+      const student: Student = {
+        id: makeStudentId(name, students.length),
+        name,
+        gender: "neutral",
+        grade: group.grade,
+        division: group.division,
+        rollNumber,
+      };
+
+      students.push(student);
+
+      const targetSeat = seatsForGroup[groupSeatIndex];
+
+      if (!targetSeat) {
+        unassignedIds.push(student.id);
+        continue;
+      }
+
+      studentIdBySeatKey.set(seatKey(targetSeat), student.id);
+      gradeKeyBySeatKey.set(seatKey(targetSeat), groupGradeKey);
+      occupiedSeatKeys.add(seatKey(targetSeat));
+      groupSeatIndex += 1;
     }
   });
 
+  const assignedSeats = seats.map((seat) => ({
+    ...seat,
+    studentId: studentIdBySeatKey.get(seatKey(seat)) ?? null,
+  }));
+  const studentsById = new Map(students.map((student) => [student.id, student]));
+
   return {
-    seats: seats.map((seat) => ({
-      ...seat,
-      studentId: studentIdBySeatKey.get(seatKey(seat)) ?? null,
-    })),
-    unassignedIds: students.slice(orderIndexByKey.size).map((student) => student.id),
+    students,
+    seats: assignedSeats,
+    unassignedIds,
+    conflictCount: examConflictCount(
+      assignedSeats,
+      studentsById,
+      rows,
+      columns,
+      "easy",
+    ),
   };
 }
 
@@ -325,14 +422,30 @@ function adjacentSeatKeys(seat: Seat, rows: number, columns: number) {
 function conflictSeatKeysFor(
   seats: Seat[],
   studentsById: Map<string, Student>,
+  rows: number,
+  columns: number,
+  difficulty: ExamDifficulty,
 ) {
-  return sideAlignmentConflictSeatKeys(seats, studentsById);
+  const conflictKeys = sameGradeNeighborConflictSeatKeys(
+    seats,
+    studentsById,
+    rows,
+    columns,
+  );
+
+  if (difficulty === "hard") {
+    sideAlignmentConflictSeatKeys(seats, studentsById).forEach((key) =>
+      conflictKeys.add(key),
+    );
+  }
+
+  return conflictKeys;
 }
 
 function sameGradeNeighborConflictSeatKeys(
   seats: Seat[],
   studentsById: Map<string, Student>,
-  rows: number,
+  _rows: number,
   columns: number,
 ) {
   const seatByKey = new Map(seats.map((seat) => [seatKey(seat), seat]));
@@ -346,7 +459,21 @@ function sameGradeNeighborConflictSeatKeys(
       return;
     }
 
-    adjacentSeatKeys(seat, rows, columns).forEach((neighborKey) => {
+    const horizontalIndex =
+      (seat.column - 1) * 2 + (seat.position === "left" ? 0 : 1);
+
+    [horizontalIndex - 1, horizontalIndex + 1].forEach((neighborIndex) => {
+      if (neighborIndex < 0 || neighborIndex >= columns * 2) {
+        return;
+      }
+
+      const neighborSeat: Seat = {
+        row: seat.row,
+        column: Math.floor(neighborIndex / 2) + 1,
+        position: neighborIndex % 2 === 0 ? "left" : "right",
+        studentId: null,
+      };
+      const neighborKey = seatKey(neighborSeat);
       const edgeKey = [seatKey(seat), neighborKey].sort().join("|");
 
       if (seenEdges.has(edgeKey)) {
@@ -354,9 +481,9 @@ function sameGradeNeighborConflictSeatKeys(
       }
 
       seenEdges.add(edgeKey);
-      const neighborSeat = seatByKey.get(neighborKey);
-      const neighborStudent = neighborSeat?.studentId
-        ? studentsById.get(neighborSeat.studentId)
+      const actualNeighborSeat = seatByKey.get(neighborKey);
+      const neighborStudent = actualNeighborSeat?.studentId
+        ? studentsById.get(actualNeighborSeat.studentId)
         : null;
 
       if (
@@ -417,10 +544,11 @@ function sideAlignmentConflictSeatKeys(
 function examConflictCount(
   seats: Seat[],
   studentsById: Map<string, Student>,
-  _rows: number,
-  _columns: number,
+  rows: number,
+  columns: number,
+  difficulty: ExamDifficulty,
 ) {
-  return conflictSeatKeysFor(seats, studentsById).size;
+  return conflictSeatKeysFor(seats, studentsById, rows, columns, difficulty).size;
 }
 
 function sameGradeNeighborConflictCount(
@@ -588,7 +716,13 @@ function placeStudentsForExam(
   return {
     seats: assignedSeats,
     unassignedIds,
-    conflictCount: examConflictCount(assignedSeats, studentsById, rows, columns),
+    conflictCount: examConflictCount(
+      assignedSeats,
+      studentsById,
+      rows,
+      columns,
+      "hard",
+    ),
   };
 }
 
@@ -870,6 +1004,7 @@ export default function Home() {
   const [rows, setRows] = useState(DEFAULT_ROWS);
   const [columns, setColumns] = useState(3);
   const [mode, setMode] = useState<SeatingMode>("classroom");
+  const [examDifficulty, setExamDifficulty] = useState<ExamDifficulty>("easy");
   const [chartTitle, setChartTitle] = useState("Classroom Seating Arrangement");
   const [roomNumber, setRoomNumber] = useState("");
   const [gradeLabel, setGradeLabel] = useState("");
@@ -930,16 +1065,16 @@ export default function Home() {
   const examConflictSeatKeys = useMemo(
     () =>
       mode === "exam"
-        ? conflictSeatKeysFor(seats, studentsById)
+        ? conflictSeatKeysFor(seats, studentsById, rows, columns, examDifficulty)
         : new Set<string>(),
-    [mode, seats, studentsById],
+    [columns, examDifficulty, mode, rows, seats, studentsById],
   );
   const examConflictCountValue = useMemo(
     () =>
       mode === "exam"
-        ? examConflictCount(seats, studentsById, rows, columns)
+        ? examConflictCount(seats, studentsById, rows, columns, examDifficulty)
         : 0,
-    [columns, mode, rows, seats, studentsById],
+    [columns, examDifficulty, mode, rows, seats, studentsById],
   );
   const seatedCount = seats.filter((seat) => seat.studentId).length;
   const unassignedStudents = unassignedIds
@@ -1141,8 +1276,13 @@ export default function Home() {
     }
 
     const sanitizedGroups = examGroups.map(sanitizeExamGroup);
-    const examStudents = generateExamStudentsFromGroups(sanitizedGroups);
-    const placed = placeStudentsForExam(examStudents, rows, columns);
+    const easyPlaced =
+      examDifficulty === "easy"
+        ? placeExamGroupsForCollection(sanitizedGroups, rows, columns)
+        : null;
+    const examStudents =
+      easyPlaced?.students ?? generateExamStudentsFromGroups(sanitizedGroups);
+    const placed = easyPlaced ?? placeStudentsForExam(examStudents, rows, columns);
     const gradeSummary = sanitizedGroups
       .map((group) => group.grade)
       .filter(Boolean)
@@ -1163,7 +1303,7 @@ export default function Home() {
         ? `${placed.conflictCount} exam seats need review`
         : placed.unassignedIds.length
           ? `${placed.unassignedIds.length} exam seats overflow`
-          : "Exam seating created",
+          : `${examDifficulty === "easy" ? "Easy" : "Hard"} exam seating created`,
     );
   }
 
@@ -1267,6 +1407,7 @@ export default function Home() {
     setRows(DEFAULT_ROWS);
     setColumns(3);
     setMode("classroom");
+    setExamDifficulty("easy");
     setChartTitle("Classroom Seating Arrangement");
     setRoomNumber("");
     setGradeLabel("");
@@ -1316,6 +1457,7 @@ export default function Home() {
       version: 1,
       exportedAt: new Date().toISOString(),
       mode,
+      examDifficulty,
       chartTitle,
       roomNumber,
       gradeLabel,
@@ -1404,6 +1546,7 @@ export default function Home() {
       setRows(restoredRows);
       setColumns(restoredColumns);
       setMode(parsed.mode === "exam" ? "exam" : "classroom");
+      setExamDifficulty(parsed.examDifficulty === "hard" ? "hard" : "easy");
       setChartTitle(
         parsed.chartTitle ||
           (parsed.mode === "exam"
@@ -1756,7 +1899,8 @@ export default function Home() {
             )}
           </section>
 
-          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          {mode === "classroom" && (
+            <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             <div className="mb-2 flex items-center justify-between">
               <h2 className="font-semibold">Paste Names</h2>
               <span className="rounded-full bg-amber-100 px-2.5 py-1 text-sm font-medium text-amber-900">
@@ -1783,7 +1927,8 @@ export default function Home() {
               <WandSparkles className="h-4 w-4" />
               Create Chart
             </button>
-          </section>
+            </section>
+          )}
 
           {mode === "exam" && (
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -1791,7 +1936,7 @@ export default function Home() {
                 <div>
                   <h2 className="font-semibold">Exam Groups</h2>
                   <p className="text-sm text-slate-500">
-                    Add grade/division ranges. Each grade family stays on one side.
+                    Add grade/division ranges, then choose the seating strength.
                   </p>
                 </div>
                 <button
@@ -1812,6 +1957,23 @@ export default function Home() {
                 >
                   Add
                 </button>
+              </div>
+              <div className="mb-3 grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
+                {(["easy", "hard"] as ExamDifficulty[]).map((option) => (
+                  <button
+                    key={option}
+                    className={cn(
+                      "rounded-lg px-3 py-2 text-sm font-semibold capitalize transition",
+                      examDifficulty === option
+                        ? "bg-white text-slate-950 shadow-sm"
+                        : "text-slate-500 hover:text-slate-800",
+                    )}
+                    type="button"
+                    onClick={() => setExamDifficulty(option)}
+                  >
+                    {option}
+                  </button>
+                ))}
               </div>
               <div className="grid gap-2">
                 <div className="grid grid-cols-[1.1fr_0.7fr_0.65fr_0.65fr_32px] gap-1 px-1 text-[11px] font-semibold uppercase text-slate-500">
@@ -1936,12 +2098,14 @@ export default function Home() {
                 Arrange Exam Seats
               </button>
               <p className="mt-2 text-xs leading-5 text-slate-500">
-                Snake fill alternates direction by visual row, keeps each grade family on one side, and mixes grades on that side where possible.
+                {examDifficulty === "easy"
+                  ? "Easy keeps each grade in one-seat-wide snake lanes for simpler collection."
+                  : "Hard keeps each grade family on one side and mixes grades on that side where possible."}
               </p>
             </section>
           )}
 
-          {students.length > 0 && (
+          {mode === "classroom" && students.length > 0 && (
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
               <div className="mb-2 flex items-center justify-between">
                 <h2 className="font-semibold">Quick Gender Setup</h2>
@@ -2034,15 +2198,17 @@ export default function Home() {
                 {showGenderColors ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
                 Colors
               </button>
-              <button
-                className="flex items-center justify-center gap-2 rounded-xl bg-sky-100 px-3 py-2 text-sm font-semibold transition hover:bg-sky-200 disabled:opacity-50"
-                disabled={students.length === 0}
-                type="button"
-                onClick={shuffleSeating}
-              >
-                <Shuffle className="h-4 w-4" />
-                Shuffle
-              </button>
+              {mode === "classroom" && (
+                <button
+                  className="flex items-center justify-center gap-2 rounded-xl bg-sky-100 px-3 py-2 text-sm font-semibold transition hover:bg-sky-200 disabled:opacity-50"
+                  disabled={students.length === 0}
+                  type="button"
+                  onClick={shuffleSeating}
+                >
+                  <Shuffle className="h-4 w-4" />
+                  Shuffle
+                </button>
+              )}
               <button
                 className="flex items-center justify-center gap-2 rounded-xl bg-rose-100 px-3 py-2 text-sm font-semibold text-rose-800 transition hover:bg-rose-200 disabled:opacity-50"
                 disabled={students.length === 0}
@@ -2188,6 +2354,7 @@ export default function Home() {
         <SeatEditorDialog
           gender={editingGender}
           hasStudent={Boolean(editingSeat.studentId)}
+          mode={mode}
           name={editingName}
           seat={editingSeat}
           onClose={closeSeatEditor}

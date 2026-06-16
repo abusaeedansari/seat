@@ -4,6 +4,8 @@ export type SeatPosition = "left" | "right";
 
 export type SeatingMode = "classroom" | "exam";
 
+export type ExamDifficulty = "easy" | "hard";
+
 export interface Student {
   id: string;
   name: string;
@@ -33,6 +35,7 @@ export interface SeatingSaveFile {
   version: 1;
   exportedAt: string;
   mode?: SeatingMode;
+  examDifficulty?: ExamDifficulty;
   chartTitle?: string;
   roomNumber?: string;
   gradeLabel?: string;
