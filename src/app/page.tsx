@@ -424,22 +424,14 @@ function conflictSeatKeysFor(
   studentsById: Map<string, Student>,
   rows: number,
   columns: number,
-  difficulty: ExamDifficulty,
+  _difficulty: ExamDifficulty,
 ) {
-  const conflictKeys = sameGradeNeighborConflictSeatKeys(
+  return sameGradeNeighborConflictSeatKeys(
     seats,
     studentsById,
     rows,
     columns,
   );
-
-  if (difficulty === "hard") {
-    sideAlignmentConflictSeatKeys(seats, studentsById).forEach((key) =>
-      conflictKeys.add(key),
-    );
-  }
-
-  return conflictKeys;
 }
 
 function sameGradeNeighborConflictSeatKeys(
